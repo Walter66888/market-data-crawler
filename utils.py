@@ -35,6 +35,16 @@ def initialize_db_connection():
             # 測試連接是否成功
             db_client.server_info()
             db = db_client["market_data"]
+            
+            # 確保必要的集合存在
+            collections = db.list_collection_names()
+            if "market_holidays" not in collections:
+                db.create_collection("market_holidays")
+                print("已創建 market_holidays 集合")
+            if "twse_index" not in collections:
+                db.create_collection("twse_index")
+                print("已創建 twse_index 集合")
+                
             print("MongoDB 連接成功 (utils)")
             return True
         except Exception as e:
