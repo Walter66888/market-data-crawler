@@ -3,12 +3,22 @@
 此文件使 crawlers 資料夾成為一個 Python 套件，方便導入各個爬蟲模組
 """
 
-# 讓 Python 在導入爬蟲模組時可以識別這個資料夾為一個套件
+# 導入基礎爬蟲類
+from .base_crawler import BaseCrawler
 
-# 可以在這裡提供方便使用的導入，例如：
+# 導入各爬蟲實現
 from .twse_crawler import TWSECrawler
 
-# 這樣在其他檔案中可以直接使用：
-# from crawlers import TWSECrawler
+# 在這裡註冊所有爬蟲，方便統一導入
+crawler_registry = {
+    'twse': TWSECrawler,
+    # 'three_institutes': ThreeInstitutesCrawler,  # 未來可以添加
+    # 'futures': FuturesCrawler,  # 未來可以添加
+}
 
-__all__ = ["TWSECrawler"]
+# 定義對外公開的類和函數
+__all__ = [
+    "BaseCrawler",
+    "TWSECrawler",
+    "crawler_registry"
+]
