@@ -14,18 +14,42 @@ import re
 import os
 from dotenv import load_dotenv
 from pymongo import MongoClient
+import traceback
 
 # 載入環境變數
 load_dotenv()
 
-# 連接 MongoDB
-mongodb_uri = os.getenv("MONGODB_URI")
-if mongodb_uri:
-    db_client = MongoClient(mongodb_uri)
-    db = db_client["market_data"]
-else:
-    db_client = None
-    db = None
+# 連接 MongoDB - 使用全局變數避免重複連接
+db_client = None
+db = None
+
+# 初始化資料庫連接
+def initialize_db_connection():
+    """初始化資料庫連接"""
+    global db_client, db
+    
+    mongodb_uri = os.getenv("MONGODB_URI")
+    if mongodb_uri:
+        try:
+            db_client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
+            # 測試連接是否成功
+            db_client.server_info()
+            db = db_client["market_data"]
+            print("MongoDB 連接成功 (utils)")
+            return True
+        except Exception as e:
+            print(f"MongoDB 連接失敗 (utils): {str(e)}")
+            db_client = None
+            db = None
+            return False
+    else:
+        print("警告：未提供MongoDB連接字串 (utils)")
+        db_client = None
+        db = None
+        return False
+
+# 嘗試初始化資料庫連接
+initialize_db_connection()
 
 def get_taiwan_current_time():
     """取得台灣目前時間"""
@@ -151,15 +175,22 @@ def fetch_taiwan_holidays(year=None):
         # 將民國年日期轉換為西元年日期
         for date_str in df[date_column]:
             # 跳過非日期值
-            if not isinstance(date_str, str) or not re.match(r'\d{4}-\d{2}-\d{2}', date_str):
+            if not isinstance(date_str, str) or not re.match(r'\d{3}/\d{2}/\d{2}', date_str):
                 continue
                 
-            holidays.append(date_str)
+            # 將民國年日期轉換為西元年日期
+            match = re.match(r'(\d+)/(\d+)/(\d+)', date_str)
+            if match:
+                year = int(match.group(1)) + 1911  # 民國年份加1911轉為西元年
+                month = match.group(2).zfill(2)    # 補零
+                day = match.group(3).zfill(2)      # 補零
+                holidays.append(f"{year}-{month}-{day}")
         
         return holidays
     
     except Exception as e:
         print(f"獲取台灣休市日期時出錯: {str(e)}")
+        traceback.print_exc()
         return []
 
 def update_holiday_database():
@@ -170,9 +201,13 @@ def update_holiday_database():
     Returns:
         bool: 操作是否成功
     """
-    if not db:
-        print("未連接到資料庫，無法更新假日資訊")
-        return False
+    global db_client, db
+    
+    # 如果資料庫連接不存在，嘗試重新連接
+    if not db_client:
+        if not initialize_db_connection():
+            print("資料庫未連接，無法更新假日資訊")
+            return False
     
     current_year = get_taiwan_current_time().year
     next_year = current_year + 1
@@ -182,8 +217,22 @@ def update_holiday_database():
         current_year_holidays = fetch_taiwan_holidays(current_year)
         next_year_holidays = fetch_taiwan_holidays(next_year)
         
+        # 如果獲取失敗，不進行更新
+        if not current_year_holidays and not next_year_holidays:
+            print("無法獲取休市日期，跳過更新")
+            return False
+        
         # 合併假日列表
         all_holidays = current_year_holidays + next_year_holidays
+        
+        # 如果還是沒有數據，則返回失敗
+        if not all_holidays:
+            print("合併後的假日列表為空，跳過更新")
+            return False
+        
+        # 確保集合存在
+        if "market_holidays" not in db.list_collection_names():
+            db.create_collection("market_holidays")
         
         # 更新資料庫
         for holiday in all_holidays:
@@ -201,6 +250,7 @@ def update_holiday_database():
     
     except Exception as e:
         print(f"更新休市日資料時出錯: {str(e)}")
+        traceback.print_exc()
         return False
 
 def is_holiday(date=None):
@@ -213,19 +263,28 @@ def is_holiday(date=None):
     Returns:
         bool: 是否為休市日
     """
-    if not db:
-        print("未連接到資料庫，無法檢查假日")
-        # 如果無法檢查，保守地假設不是假日
-        return False
+    global db_client, db
+    
+    # 如果資料庫連接不存在，嘗試重新連接
+    if not db_client:
+        if not initialize_db_connection():
+            print("資料庫未連接，無法檢查假日")
+            # 如果無法檢查，保守地假設不是假日
+            return False
     
     if date is None:
         date = get_taiwan_current_time().strftime("%Y-%m-%d")
     elif isinstance(date, datetime):
         date = date.strftime("%Y-%m-%d")
     
-    # 從資料庫查詢
-    holiday = db.market_holidays.find_one({"date": date})
-    return holiday is not None
+    try:
+        # 從資料庫查詢
+        holiday = db.market_holidays.find_one({"date": date})
+        return holiday is not None
+    except Exception as e:
+        print(f"檢查假日時出錯: {str(e)}")
+        # 如果查詢出錯，保守地假設不是假日
+        return False
 
 def check_trading_day(date=None):
     """
@@ -284,19 +343,32 @@ def check_if_already_crawled_today():
     Returns:
         bool: 是否已經爬取
     """
-    if not db:
+    global db_client, db
+    
+    # 如果資料庫連接不存在，嘗試重新連接
+    if not db_client:
+        if not initialize_db_connection():
+            print("資料庫未連接，無法檢查是否已爬取")
+            return False
+    
+    try:
+        # 獲取今天的日期範圍
+        now = get_taiwan_current_time()
+        today_start = datetime(now.year, now.month, now.day, tzinfo=now.tzinfo)
+        
+        # 確保集合存在
+        if "twse_index" not in db.list_collection_names():
+            return False
+        
+        # 檢查今天是否已經有爬取記錄
+        result = db.twse_index.find_one({
+            "fetched_at": {"$gte": today_start.isoformat()}
+        })
+        
+        return result is not None
+    except Exception as e:
+        print(f"檢查今天是否已爬取時出錯: {str(e)}")
         return False
-    
-    # 獲取今天的日期範圍
-    now = get_taiwan_current_time()
-    today_start = datetime(now.year, now.month, now.day, tzinfo=now.tzinfo)
-    
-    # 檢查今天是否已經有爬取記錄
-    result = db.twse_index.find_one({
-        "fetched_at": {"$gte": today_start.isoformat()}
-    })
-    
-    return result is not None
 
 def should_crawl_on_startup():
     """
