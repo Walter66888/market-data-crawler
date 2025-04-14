@@ -4,18 +4,21 @@
 資料來源：https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?response=html
 """
 
-import requests
 import pandas as pd
 from datetime import datetime
-import pytz
 import re
 from bs4 import BeautifulSoup
 import time
 import random
-import json
+from pymongo import MongoClient
 import os
 from dotenv import load_dotenv
-from pymongo import MongoClient
+
+# 導入工具函數
+from utils import (
+    get_taiwan_current_time, fetch_with_retry, retry_operation,
+    exponential_backoff
+)
 
 # 載入環境變數
 load_dotenv()
@@ -52,11 +55,6 @@ class TWSECrawler:
             self.db = self.db_client["market_data"]
             self.collection = self.db["twse_index"]
     
-    def _get_taiwan_current_time(self):
-        """取得台灣目前時間"""
-        taiwan_tz = pytz.timezone('Asia/Taipei')
-        return datetime.now(taiwan_tz)
-    
     def _convert_chinese_date_to_iso(self, date_str):
         """
         將中文日期格式(如：113/04/01)轉換為ISO標準格式(YYYY-MM-DD)
@@ -84,8 +82,12 @@ class TWSECrawler:
             dict: 包含最新加權指數資料的字典，若失敗則返回None
         """
         try:
-            response = requests.get(self.url, headers=self.headers)
-            response.raise_for_status()  # 確保回應成功
+            # 使用重試機制進行HTTP請求
+            response = fetch_with_retry(
+                url=self.url, 
+                headers=self.headers,
+                timeout=30
+            )
             
             # 解析HTML
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -119,27 +121,40 @@ class TWSECrawler:
                 "transactions": latest_data['成交筆數'],
                 "index": latest_data['發行量加權股價指數'],
                 "change": latest_data['漲跌點數'],
-                "fetched_at": self._get_taiwan_current_time().isoformat()
+                "fetched_at": get_taiwan_current_time().isoformat()
             }
             
             # 儲存到資料庫
             if self.collection:
-                # 檢查是否已有相同日期的資料
-                existing = self.collection.find_one({"date": iso_date})
-                if existing:
-                    self.collection.update_one(
-                        {"date": iso_date},
-                        {"$set": result}
-                    )
-                else:
-                    self.collection.insert_one(result)
-                print(f"資料已{('更新' if existing else '新增')}至資料庫")
+                self._save_to_database(result)
             
             return result
             
         except Exception as e:
             print(f"爬取加權指數資料時發生錯誤: {str(e)}")
             return None
+    
+    def _save_to_database(self, data):
+        """
+        將數據保存到資料庫
+        
+        Args:
+            data: 要保存的數據字典
+        """
+        try:
+            # 檢查是否已有相同日期的資料
+            existing = self.collection.find_one({"date": data["date"]})
+            if existing:
+                self.collection.update_one(
+                    {"date": data["date"]},
+                    {"$set": data}
+                )
+                print(f"資料已更新至資料庫: {data['date']}")
+            else:
+                self.collection.insert_one(data)
+                print(f"資料已新增至資料庫: {data['date']}")
+        except Exception as e:
+            print(f"儲存資料至資料庫時出錯: {str(e)}")
     
     def format_output(self, data):
         """
@@ -158,10 +173,14 @@ class TWSECrawler:
         trading_value = float(data["trading_value"].replace(',', ''))
         trading_value_billion = trading_value / 100000000  # 轉換為億元
         
+        # 計算漲跌符號
+        change = float(data['change'])
+        change_symbol = "▲" if change > 0 else "▼" if change < 0 else "-"
+        
         # 格式化輸出
         formatted_output = (
             f"📊 大盤資訊 {data['chinese_date']}\n"
-            f"加權指數：{data['index']} {'▲' if float(data['change']) > 0 else '▼'} {abs(float(data['change']))}\n"
+            f"加權指數：{data['index']} {change_symbol} {abs(change)}\n"
             f"成交金額：{trading_value_billion:.2f} 億元\n"
             f"成交筆數：{data['transactions']}\n"
         )
@@ -187,14 +206,14 @@ class TWSECrawler:
             # 檢查爬取的資料是否是今天的
             # 注意：假日或是盤後未更新時，最新數據可能不是今天的
             if data:
-                taiwan_now = self._get_taiwan_current_time()
+                taiwan_now = get_taiwan_current_time()
                 today_date = taiwan_now.strftime("%Y-%m-%d")
                 
                 # 如果爬取的資料是最新的（當日數據或最後交易日數據）
                 # 這裡簡化判斷，實際上可能需要比較複雜的邏輯確定是否為最新數據
                 return data
             
-            # 隨機等待一段時間後重試
+            # 使用指數退避算法計算等待時間
             if attempt < max_retries - 1:
                 wait_minutes = random.uniform(retry_interval_min, retry_interval_max)
                 wait_seconds = int(wait_minutes * 60)
