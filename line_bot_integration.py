@@ -7,7 +7,7 @@ import os
 import json
 from datetime import datetime, timedelta
 import pytz
-from flask import Flask, request, abort
+from flask import request, abort, Blueprint
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
@@ -22,7 +22,8 @@ from dotenv import load_dotenv
 # 載入環境變數
 load_dotenv()
 
-app = Flask(__name__)
+# 創建 Blueprint 而不是 Flask 應用
+line_bot_bp = Blueprint('line_bot', __name__)
 
 # 設定 Line Bot API
 line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
@@ -100,7 +101,7 @@ def format_market_data_message(market_data):
     
     return message
 
-@app.route("/callback", methods=['POST'])
+@line_bot_bp.route("/callback", methods=['POST'])
 def callback():
     """Line Bot 回調函數"""
     # 獲取 X-Line-Signature 標頭值
@@ -108,7 +109,7 @@ def callback():
 
     # 獲取請求主體
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
+    print("Request body:", body)  # 使用 print 代替 app.logger
 
     # 處理 webhook
     try:
@@ -183,7 +184,7 @@ def send_daily_push_notification():
     except Exception as e:
         print(f"發送推送通知時出錯: {str(e)}")
 
-@app.route("/push-notification", methods=['POST'])
+@line_bot_bp.route("/push-notification", methods=['POST'])
 def trigger_push_notification():
     """
     手動觸發推送通知的 API 端點
@@ -197,17 +198,7 @@ def trigger_push_notification():
     send_daily_push_notification()
     return {"status": "success", "message": "推送通知已觸發"}
 
-@app.route("/test-db")
-def test_db():
-    """
-    測試資料庫連接的 API 端點
-    """
-    try:
-        dbs = client.list_database_names()
-        return {"status": "success", "databases": dbs}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-if __name__ == "__main__":
-    # 本地測試
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+@line_bot_bp.route("/test", methods=['GET'])
+def test_line_bot():
+    """測試 Line Bot 整合是否正常加載"""
+    return {"status": "success", "message": "Line Bot 整合模組運行正常"}
