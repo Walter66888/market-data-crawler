@@ -17,8 +17,10 @@ from linebot.models import (
     TextComponent, ButtonComponent, URIAction,
     QuickReply, QuickReplyButton, MessageAction
 )
-from pymongo import MongoClient
 from dotenv import load_dotenv
+
+# 導入資料庫訪問層
+from database.db_access import db_layer
 
 # 載入環境變數
 load_dotenv()
@@ -29,11 +31,6 @@ line_bot_bp = Blueprint('line_bot', __name__)
 # 設定 Line Bot API
 line_bot_api = None
 handler = None
-
-# MongoDB 連接
-mongodb_uri = os.environ.get("MONGODB_URI")
-db_client = None
-db = None
 
 # 初始化 Line Bot API
 def initialize_line_bot():
@@ -55,105 +52,72 @@ def initialize_line_bot():
         print("未設定 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET 環境變數")
         return False
 
-# 初始化資料庫連接
-def initialize_db():
-    """初始化資料庫連接"""
-    global db_client, db
-    
-    mongodb_uri = os.environ.get("MONGODB_URI")
-    if mongodb_uri:
-        try:
-            db_client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
-            # 測試連接是否成功
-            db_client.server_info()
-            db = db_client["market_data"]
-            
-            # 確保必要的集合存在
-            collections = db.list_collection_names()
-            if "market_holidays" not in collections:
-                db.create_collection("market_holidays")
-                print("已創建 market_holidays 集合")
-            if "twse_index" not in collections:
-                db.create_collection("twse_index")
-                print("已創建 twse_index 集合")
-                
-            print("MongoDB 連接成功 (line_bot)")
-            return True
-        except Exception as e:
-            print(f"MongoDB 連接失敗 (line_bot): {str(e)}")
-            db_client = None
-            db = None
-            return False
-    else:
-        print("警告：未提供MongoDB連接字串 (line_bot)")
-        db_client = None
-        db = None
-        return False
-
 # 執行初始化
 initialize_line_bot()
-initialize_db()
 
-def _get_taiwan_current_time():
+def get_taiwan_current_time():
     """取得台灣目前時間"""
     taiwan_tz = pytz.timezone('Asia/Taipei')
     return datetime.now(taiwan_tz)
 
 def get_latest_market_data():
     """
-    獲取最新的市場資料
+    獲取最新的市場資料，如果沒有當天資料，則返回最後一筆資料
     
     Returns:
-        dict: 包含各類市場資料的字典
+        tuple: (資料字典, 是否為今天的資料)
     """
-    global db_client, db
-    
-    # 如果資料庫連接不存在，嘗試重新連接
-    if not db_client:
-        if not initialize_db():
-            print("資料庫未連接，無法獲取市場資料")
-            return None
-    
     try:
-        # 確保集合存在
-        collections = db.list_collection_names()
-        if "twse_index" not in collections:
-            db.create_collection("twse_index")
-            print("在獲取市場資料時創建了 twse_index 集合")
-            # 集合剛創建，還沒有數據
-            return None
+        # 確保資料庫連接存在
+        if not db_layer.db_client:
+            print("資料庫未連接，無法獲取市場資料")
+            return None, False
         
-        # 取得最新的加權指數資料
-        latest_index = db.twse_index.find_one(
+        # 確保集合存在
+        if "twse_index" not in db_layer.db.list_collection_names():
+            print("twse_index 集合不存在")
+            return None, False
+        
+        # 取得今天的日期範圍
+        now = get_taiwan_current_time()
+        today_date = now.strftime("%Y-%m-%d")
+        
+        # 先嘗試獲取今天的資料
+        today_data = db_layer.find_one(
+            "twse_index", 
+            {"date": today_date}
+        )
+        
+        if today_data:
+            print(f"找到今天({today_date})的加權指數資料")
+            return {"index_data": today_data}, True
+        
+        # 如果沒有今天的資料，則獲取最新的資料
+        latest_data = db_layer.find_one(
+            "twse_index",
             sort=[("date", -1)]  # 按日期降序排序
         )
         
-        # 如果沒有找到數據，返回 None
-        if not latest_index:
-            print("找不到任何加權指數資料")
-            return None
+        if latest_data:
+            print(f"找到最新的加權指數資料，日期為: {latest_data.get('date', 'unknown')}")
+            return {"index_data": latest_data}, False
         
-        # 調試輸出
-        print(f"獲取到最新市場資料，日期: {latest_index.get('date', 'unknown')}")
+        # 如果集合中沒有任何資料
+        print("找不到任何加權指數資料")
+        return None, False
         
-        # 這裡可以加入其他資料來源的查詢
-        # 例如: 三大法人、期貨資料等
-        
-        return {
-            "index_data": latest_index,
-            # 可以添加其他資料
-        }
     except Exception as e:
         print(f"獲取市場資料時出錯: {str(e)}")
         traceback.print_exc()
-        return None
+        return None, False
 
-def format_market_data_message(market_data):
+def format_market_data_message(market_data, is_today_data=False):
     """
     格式化市場資料為易讀的文字訊息
     
     Args:
         market_data: 市場資料字典
+        is_today_data: 是否為今天的資料
         
     Returns:
         str: 格式化後的文字訊息
@@ -164,7 +128,7 @@ def format_market_data_message(market_data):
     index_data = market_data["index_data"]
     
     # 檢查必要欄位是否存在
-    required_fields = ["trading_value", "change", "chinese_date", "index", "transactions"]
+    required_fields = ["trading_value", "change", "chinese_date", "index", "transactions", "date"]
     for field in required_fields:
         if field not in index_data:
             return f"市場資料缺少必要欄位: {field}"
@@ -181,14 +145,23 @@ def format_market_data_message(market_data):
         date_parts = index_data["chinese_date"].split('/')
         formatted_date = f"{date_parts[0]}年{date_parts[1]}月{date_parts[2]}日"
         
+        # 判斷是否為今天的資料
+        data_date = index_data["date"]
+        today_date = get_taiwan_current_time().strftime("%Y-%m-%d")
+        date_notice = ""
+        
+        if not is_today_data:
+            # 明確告知用戶這不是今天的資料
+            date_notice = f"\n⚠️ 注意：這是 {data_date} 的歷史資料，尚未更新今日資料"
+        
         message = (
             f"📊 盤後籌碼資訊 {formatted_date}\n"
             f"------------------------\n"
             f"📈 加權指數：{index_data['index']} {change_symbol} {abs(change)}\n"
             f"💰 成交金額：{trading_value_billion:.2f} 億元\n"
             f"🔢 成交筆數：{index_data['transactions']}\n"
-            f"------------------------\n"
-            # 這裡可以加入其他資料
+            f"------------------------"
+            f"{date_notice}"
         )
         
         return message
@@ -244,16 +217,17 @@ def handle_message(event):
     
     if text.lower() in ['盤後', '盤後資訊', '盤後籌碼', '今日盤後', '加權指數']:
         # 提供盤後資訊
-        market_data = get_latest_market_data()
+        market_data, is_today_data = get_latest_market_data()
         
         if not market_data:
-            # 如果無法獲取市場資料，提供友好訊息
+            # 如果無法獲取任何市場資料
             message = (
-                "目前尚未有盤後資料，請稍後再試。\n"
+                "目前無法取得盤後資料，請稍後再試。\n"
                 "系統將在每日收盤後自動更新資料。"
             )
         else:
-            message = format_market_data_message(market_data)
+            # 即使不是最新資料，也會顯示最後一筆可用的資料
+            message = format_market_data_message(market_data, is_today_data)
         
         # 添加快速回覆按鈕
         quick_reply = QuickReply(items=[
@@ -321,13 +295,13 @@ def send_daily_push_notification():
             return False
         
         # 獲取最新市場數據
-        market_data = get_latest_market_data()
+        market_data, is_today_data = get_latest_market_data()
         if not market_data:
             print("無法獲取市場數據，取消推送")
             return False
             
         # 格式化訊息
-        message = format_market_data_message(market_data)
+        message = format_market_data_message(market_data, is_today_data)
         
         # 發送推送通知
         line_bot_api.push_message(
@@ -364,23 +338,26 @@ def test_line_bot():
     """測試 Line Bot 整合是否正常加載"""
     # 檢查資料庫連接
     db_connected = False
-    if db_client:
+    if db_layer.db_client:
         try:
-            db_client.server_info()
+            db_layer.db_client.server_info()
             db_connected = True
         except:
             db_connected = False
     
     # 檢查最新市場資料
     latest_data = None
+    is_today_data = False
+    
     if db_connected:
         try:
-            market_data = get_latest_market_data()
+            market_data, is_today_data = get_latest_market_data()
             if market_data and market_data.get("index_data"):
                 latest_data = {
                     "date": market_data["index_data"].get("date", "unknown"),
                     "index": market_data["index_data"].get("index", "unknown"),
-                    "change": market_data["index_data"].get("change", "unknown")
+                    "change": market_data["index_data"].get("change", "unknown"),
+                    "is_today_data": is_today_data
                 }
         except:
             latest_data = None
@@ -397,7 +374,7 @@ def test_line_bot():
 def manual_get_market_data():
     """手動測試獲取市場資料的 API 端點"""
     try:
-        market_data = get_latest_market_data()
+        market_data, is_today_data = get_latest_market_data()
         
         if not market_data:
             return jsonify({
@@ -405,7 +382,7 @@ def manual_get_market_data():
                 "message": "無法獲取市場資料"
             })
         
-        formatted_message = format_market_data_message(market_data)
+        formatted_message = format_market_data_message(market_data, is_today_data)
         
         # 移除 _id 欄位，因為它不能被 JSON 序列化
         if market_data and "index_data" in market_data and "_id" in market_data["index_data"]:
@@ -414,7 +391,8 @@ def manual_get_market_data():
         return jsonify({
             "status": "success",
             "formatted_message": formatted_message,
-            "raw_data": market_data
+            "raw_data": market_data,
+            "is_today_data": is_today_data
         })
     except Exception as e:
         return jsonify({
