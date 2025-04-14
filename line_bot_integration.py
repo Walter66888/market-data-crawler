@@ -106,8 +106,11 @@ def get_latest_market_data():
     
     try:
         # 確保集合存在
-        if "twse_index" not in db.list_collection_names():
-            print("twse_index 集合不存在，無法獲取資料")
+        collections = db.list_collection_names()
+        if "twse_index" not in collections:
+            db.create_collection("twse_index")
+            print("在獲取市場資料時創建了 twse_index 集合")
+            # 集合剛創建，還沒有數據
             return None
         
         # 取得最新的加權指數資料
@@ -123,12 +126,8 @@ def get_latest_market_data():
         # 調試輸出
         print(f"獲取到最新市場資料，日期: {latest_index.get('date', 'unknown')}")
         
-        # 這裡可以加入其他資料來源的查詢
-        # 例如: 三大法人、期貨資料等
-        
         return {
             "index_data": latest_index,
-            # 可以添加其他資料
         }
     except Exception as e:
         print(f"獲取市場資料時出錯: {str(e)}")
