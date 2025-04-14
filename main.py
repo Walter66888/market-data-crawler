@@ -8,16 +8,13 @@ import time
 import random
 import threading
 import schedule
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 from dotenv import load_dotenv
-from pymongo import MongoClient
 from flask import Flask, request, jsonify, abort
 
-# 導入爬蟲模組 - 從 crawlers 包中導入
-from crawlers.twse_crawler import TWSECrawler
-# 後續可以添加其他爬蟲:
-# from crawlers.other_crawler import OtherCrawler
+# 導入爬蟲註冊表
+from crawlers import crawler_registry
 
 # 導入 Line Bot 模組和工具函數
 from line_bot_integration import send_daily_push_notification, line_bot_bp
@@ -25,6 +22,9 @@ from utils import (
     get_taiwan_current_time, check_trading_day, update_holiday_database,
     should_crawl_on_startup, check_if_already_crawled_today
 )
+
+# 導入資料庫訪問層
+from database.db_access import db_layer
 
 # 載入環境變數
 load_dotenv()
@@ -34,32 +34,9 @@ app = Flask(__name__)
 # 註冊 Line Bot Blueprint
 app.register_blueprint(line_bot_bp)
 
-# 設置資料庫連接
-mongodb_uri = os.getenv("MONGODB_URI")
-if mongodb_uri:
-    try:
-        db_client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
-        # 測試連接是否成功
-        db_client.server_info()
-        db = db_client["market_data"]
-        print("MongoDB 連接成功")
-    except Exception as e:
-        print(f"MongoDB 連接失敗: {str(e)}")
-        db_client = None
-        db = None
-else:
-    print("警告：未提供MongoDB連接字串")
-    db_client = None
-    db = None
-
 def crawl_all_data():
     """爬取所有數據"""
     print(f"開始爬取所有數據 - {get_taiwan_current_time().isoformat()}")
-    
-    # 檢查資料庫連接
-    if not db_client:
-        print("資料庫未連接，無法爬取數據")
-        return False
     
     # 檢查是否為交易日
     if not check_trading_day():
@@ -81,26 +58,17 @@ def crawl_all_data():
     data_updated = False
     all_data = {}
     
-    # 爬取加權指數資料
-    try:
-        twse_crawler = TWSECrawler(db_client)
-        index_data = twse_crawler.check_and_fetch_data()
-        if index_data:
-            all_data["index_data"] = index_data
-            data_updated = True
-    except Exception as e:
-        print(f"爬取加權指數資料時出錯: {str(e)}")
-    
-    # 這裡可以加入其他爬蟲模組的調用
-    # 例如：
-    # try:
-    #     other_crawler = OtherCrawler(db_client)
-    #     other_data = other_crawler.check_and_fetch_data()
-    #     if other_data:
-    #         all_data["other_data"] = other_data
-    #         data_updated = True
-    # except Exception as e:
-    #     print(f"爬取其他資料時出錯: {str(e)}")
+    # 使用爬蟲註冊表動態爬取所有數據
+    for crawler_name, crawler_class in crawler_registry.items():
+        try:
+            print(f"開始爬取 {crawler_name} 數據...")
+            crawler = crawler_class()
+            data = crawler.check_and_fetch_data()
+            if data:
+                all_data[crawler_name] = data
+                data_updated = True
+        except Exception as e:
+            print(f"爬取 {crawler_name} 數據時出錯: {str(e)}")
     
     # 如果有數據更新，則發送 Line 通知
     if data_updated:
@@ -117,25 +85,20 @@ def force_crawl_data():
     """強制爬取資料，用於初始化"""
     print(f"強制爬取初始數據 - {get_taiwan_current_time().isoformat()}")
     
-    # 檢查資料庫連接
-    if not db_client:
-        print("資料庫未連接，無法爬取數據")
-        return False
-    
     data_updated = False
     all_data = {}
     
-    # 爬取加權指數資料
-    try:
-        twse_crawler = TWSECrawler(db_client)
-        index_data = twse_crawler.check_and_fetch_data(ignore_time_check=True)
-        if index_data:
-            all_data["index_data"] = index_data
-            data_updated = True
-    except Exception as e:
-        print(f"強制爬取加權指數資料時出錯: {str(e)}")
-    
-    # 這裡可以加入其他爬蟲模組的強制爬取
+    # 使用爬蟲註冊表動態爬取所有數據
+    for crawler_name, crawler_class in crawler_registry.items():
+        try:
+            print(f"強制爬取 {crawler_name} 數據...")
+            crawler = crawler_class()
+            data = crawler.check_and_fetch_data(ignore_time_check=True)
+            if data:
+                all_data[crawler_name] = data
+                data_updated = True
+        except Exception as e:
+            print(f"強制爬取 {crawler_name} 數據時出錯: {str(e)}")
     
     return data_updated
 
@@ -175,20 +138,15 @@ def check_and_crawl_if_needed():
 
 def check_database_initialized():
     """檢查資料庫是否已初始化"""
-    if not db_client:
-        return False
-    
     try:
-        # 檢查是否存在 market_data 資料庫
-        databases = db_client.list_database_names()
-        
+        # 檢查資料庫連接狀態
+        if not db_layer.db_client:
+            return False
+            
         # 檢查重要集合是否存在且有數據
-        has_holidays = False
-        has_index_data = False
-        
-        if "market_data" in databases:
-            has_holidays = db.market_holidays.count_documents({}) > 0
-            has_index_data = db.twse_index.count_documents({}) > 0
+        collections = db_layer.db.list_collection_names()
+        has_holidays = "market_holidays" in collections and db_layer.count_documents("market_holidays") > 0
+        has_index_data = "twse_index" in collections and db_layer.count_documents("twse_index") > 0
         
         return has_holidays and has_index_data
     except Exception as e:
@@ -199,23 +157,12 @@ def initialize_system():
     """系統初始化函數"""
     print("正在初始化系統...")
     
-    # 檢查資料庫連接
-    if not db_client:
-        print("資料庫未連接，無法初始化系統")
-        return False
-    
     # 檢查資料庫是否已初始化
     is_initialized = check_database_initialized()
     
     if not is_initialized:
         print("系統尚未初始化，開始執行自動初始化...")
         try:
-            # 確保資料庫中有所需的集合
-            if "market_holidays" not in db.list_collection_names():
-                db.create_collection("market_holidays")
-            if "twse_index" not in db.list_collection_names():
-                db.create_collection("twse_index")
-            
             # 初始化假日資料庫
             print("正在初始化假日資料...")
             update_success = update_holiday_database()
@@ -247,7 +194,7 @@ def initialize_system():
 def home():
     """首頁"""
     # 檢查資料庫連接狀態
-    db_status = "已連接" if db_client else "未連接"
+    db_status = "已連接" if db_layer.db_client else "未連接"
     return f"盤後籌碼爬蟲服務正在運行。資料庫狀態：{db_status}"
 
 @app.route("/health")
@@ -256,10 +203,10 @@ def health_check():
     try:
         # 檢查資料庫連接
         db_connected = False
-        if db_client:
+        if db_layer.db_client:
             try:
                 # 嘗試執行一個簡單的資料庫操作
-                db_client.server_info()
+                db_layer.db_client.server_info()
                 db_connected = True
             except Exception as e:
                 db_connected = False
@@ -273,7 +220,8 @@ def health_check():
             "is_trading_day": check_trading_day(),
             "already_crawled_today": check_if_already_crawled_today() if db_connected else False,
             "database_connected": db_connected,
-            "database_initialized": db_initialized
+            "database_initialized": db_initialized,
+            "registered_crawlers": list(crawler_registry.keys())
         })
     except Exception as e:
         return jsonify({
@@ -294,18 +242,35 @@ def manual_crawl():
         abort(403)  # 拒絕未授權的訪問
     
     try:
-        # 檢查資料庫連接
-        if not db_client:
-            return jsonify({
-                "status": "error",
-                "message": "資料庫未連接，無法執行爬蟲"
-            })
+        # 可以指定特定爬蟲
+        crawler_name = request.args.get('crawler')
         
-        success = crawl_all_data()
-        return jsonify({
-            "status": "success" if success else "no_update",
-            "message": "爬蟲已執行" + ("且數據已更新" if success else "但無新數據")
-        })
+        if crawler_name:
+            if crawler_name in crawler_registry:
+                # 執行特定爬蟲
+                print(f"手動觸發爬蟲: {crawler_name}")
+                crawler = crawler_registry[crawler_name]()
+                data = crawler.check_and_fetch_data()
+                success = data is not None
+                
+                return jsonify({
+                    "status": "success" if success else "no_update",
+                    "crawler": crawler_name,
+                    "message": f"爬蟲 {crawler_name} 已執行" + ("且數據已更新" if success else "但無新數據")
+                })
+            else:
+                return jsonify({
+                    "status": "error",
+                    "message": f"未知的爬蟲: {crawler_name}",
+                    "available_crawlers": list(crawler_registry.keys())
+                })
+        else:
+            # 執行所有爬蟲
+            success = crawl_all_data()
+            return jsonify({
+                "status": "success" if success else "no_update",
+                "message": "所有爬蟲已執行" + ("且數據已更新" if success else "但無新數據")
+            })
     except Exception as e:
         return jsonify({
             "status": "error",
@@ -323,19 +288,6 @@ def force_initialize():
         abort(403)  # 拒絕未授權的訪問
     
     try:
-        # 檢查資料庫連接
-        if not db_client:
-            return jsonify({
-                "status": "error",
-                "message": "資料庫未連接，無法初始化系統"
-            })
-        
-        # 確保資料庫中有所需的集合
-        if "market_holidays" not in db.list_collection_names():
-            db.create_collection("market_holidays")
-        if "twse_index" not in db.list_collection_names():
-            db.create_collection("twse_index")
-        
         # 更新假日資料
         update_success = update_holiday_database()
         
@@ -365,13 +317,6 @@ def trigger_update_holidays():
         abort(403)  # 拒絕未授權的訪問
     
     try:
-        # 檢查資料庫連接
-        if not db_client:
-            return jsonify({
-                "status": "error",
-                "message": "資料庫未連接，無法更新假日資料"
-            })
-        
         success = update_holiday_database()
         return jsonify({
             "status": "success" if success else "error",
@@ -389,34 +334,32 @@ def test_db():
     測試資料庫連接的 API 端點
     """
     try:
-        if not db_client:
+        if not db_layer.db_client:
             return jsonify({"status": "error", "message": "未連接到資料庫"})
         
         # 測試連接是否成功
-        db_client.server_info()
+        db_layer.db_client.server_info()
         
         # 獲取數據庫列表
-        dbs = db_client.list_database_names()
+        dbs = db_layer.db_client.list_database_names()
         
         # 檢查初始化狀態
         is_initialized = check_database_initialized()
         
         # 獲取集合列表
-        collections = []
-        if "market_data" in dbs:
-            collections = db.list_collection_names()
+        collections = db_layer.db.list_collection_names() if "market_data" in dbs else []
             
-            # 獲取各集合的文檔數量
-            collection_counts = {}
-            for collection in collections:
-                collection_counts[collection] = db[collection].count_documents({})
+        # 獲取各集合的文檔數量
+        collection_counts = {}
+        for collection in collections:
+            collection_counts[collection] = db_layer.count_documents(collection)
         
         return jsonify({
             "status": "success", 
             "databases": dbs,
             "initialized": is_initialized,
             "collections": collections,
-            "collection_counts": collection_counts if 'collection_counts' in locals() else {}
+            "collection_counts": collection_counts
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
@@ -465,32 +408,36 @@ def debug_info():
                 "line_token_set": bool(os.getenv("LINE_CHANNEL_ACCESS_TOKEN")),
                 "line_secret_set": bool(os.getenv("LINE_CHANNEL_SECRET")),
                 "line_target_set": bool(os.getenv("LINE_PUSH_TARGET"))
-            }
+            },
+            "registered_crawlers": list(crawler_registry.keys())
         }
         
         # 檢查資料庫連接
-        if db_client:
+        if db_layer.db_client:
             try:
-                db_client.server_info()
+                db_layer.db_client.server_info()
                 info["database"] = {
                     "status": "connected",
-                    "databases": db_client.list_database_names()
+                    "databases": db_layer.db_client.list_collection_names() if hasattr(db_layer.db_client, 'list_collection_names') else []
                 }
                 
-                if "market_data" in info["database"]["databases"]:
-                    info["database"]["collections"] = db.list_collection_names()
+                collections = db_layer.db.list_collection_names() if hasattr(db_layer.db, 'list_collection_names') else []
+                info["database"]["collections"] = collections
+                
+                # 獲取各集合的文檔數量
+                info["database"]["collection_counts"] = {}
+                info["database"]["latest_docs"] = {}
+                
+                for collection in collections:
+                    count = db_layer.count_documents(collection)
+                    info["database"]["collection_counts"][collection] = count
                     
-                    # 獲取各集合的文檔數量
-                    info["database"]["collection_counts"] = {}
-                    for collection in info["database"]["collections"]:
-                        info["database"]["collection_counts"][collection] = db[collection].count_documents({})
-                        
-                        # 如果有文檔，獲取最新的一條記錄
-                        if db[collection].count_documents({}) > 0:
-                            latest_doc = db[collection].find_one(sort=[("_id", -1)])
-                            if latest_doc and "_id" in latest_doc:
-                                latest_doc["_id"] = str(latest_doc["_id"])
-                            info["database"]["latest_docs"] = {collection: latest_doc}
+                    # 如果有文檔，獲取最新的一條記錄
+                    if count > 0:
+                        latest_doc = db_layer.find_one(collection, {}, sort=[("_id", -1)])
+                        if latest_doc and "_id" in latest_doc:
+                            latest_doc["_id"] = str(latest_doc["_id"])
+                        info["database"]["latest_docs"][collection] = latest_doc
             except Exception as e:
                 info["database"] = {
                     "status": "error",
@@ -504,6 +451,25 @@ def debug_info():
         return jsonify(info)
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/list-crawlers")
+def list_crawlers():
+    """列出所有已註冊的爬蟲"""
+    registered_crawlers = {}
+    
+    for name, crawler_class in crawler_registry.items():
+        crawler_info = {
+            "name": name,
+            "class": crawler_class.__name__,
+            "collection": getattr(crawler_class, 'collection_name', None) or name,
+            "description": crawler_class.__doc__ or "無描述"
+        }
+        registered_crawlers[name] = crawler_info
+    
+    return jsonify({
+        "status": "success",
+        "crawlers": registered_crawlers
+    })
 
 if __name__ == "__main__":
     # 在啟動時進行系統初始化
