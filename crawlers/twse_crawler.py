@@ -1,22 +1,26 @@
 """
 台灣證交所加權指數爬蟲
 功能：爬取台灣證交所的加權指數資料
-資料來源：https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?response=json
+資料來源：https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?response=html
 """
 
+import pandas as pd
 import re
+from bs4 import BeautifulSoup
+import time
+import random
 import traceback
 from datetime import datetime
 import pytz
 import requests
+from pymongo import MongoClient
+import os
 from dotenv import load_dotenv
 
 # 載入環境變數
 load_dotenv()
 
 class TWSECrawler:
-    """台灣證交所加權指數爬蟲類"""
-    
     def __init__(self, db_client=None):
         """
         初始化爬蟲類別
@@ -24,26 +28,47 @@ class TWSECrawler:
         Args:
             db_client: MongoDB客戶端實例，如果為None則嘗試創建新連接
         """
-        # 設置資料來源URL和請求標頭
-        self.base_url = "https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK"
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://www.twse.com.tw/",
-        }
-        
         # 設置資料庫連接
-        self.db_client = db_client
-        if db_client:
-            self.db = db_client["market_data"]
-            # 確保集合存在
-            if "twse_index" not in self.db.list_collection_names():
-                self.db.create_collection("twse_index")
-            self.collection = self.db["twse_index"]
+        if db_client is None:
+            mongodb_uri = os.getenv("MONGODB_URI")
+            if mongodb_uri:
+                try:
+                    self.db_client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=5000)
+                    # 測試連接是否成功
+                    self.db_client.server_info()
+                    self.db = self.db_client["market_data"]
+                    # 確保集合存在
+                    if "twse_index" not in self.db.list_collection_names():
+                        self.db.create_collection("twse_index")
+                    self.collection = self.db["twse_index"]
+                    print("MongoDB 連接成功 (twse_crawler)")
+                except Exception as e:
+                    print(f"MongoDB 連接失敗 (twse_crawler): {str(e)}")
+                    traceback.print_exc()
+                    self.db_client = None
+                    self.db = None
+                    self.collection = None
+            else:
+                print("警告：未提供MongoDB連接字串，資料將不會被儲存。")
+                self.db_client = None
+                self.db = None
+                self.collection = None
         else:
-            self.db = None
-            self.collection = None
+            try:
+                # 測試提供的連接是否有效
+                db_client.server_info()
+                self.db_client = db_client
+                self.db = self.db_client["market_data"]
+                # 確保集合存在
+                if "twse_index" not in self.db.list_collection_names():
+                    self.db.create_collection("twse_index")
+                self.collection = self.db["twse_index"]
+            except Exception as e:
+                print(f"使用提供的 MongoDB 連接時出錯: {str(e)}")
+                traceback.print_exc()
+                self.db_client = None
+                self.db = None
+                self.collection = None
     
     def _convert_chinese_date_to_iso(self, date_str):
         """
@@ -53,7 +78,7 @@ class TWSECrawler:
             date_str: 中文日期字串
             
         Returns:
-            ISO格式日期字串或None
+            ISO格式日期字串
         """
         # 處理民國年
         match = re.match(r'(\d+)/(\d+)/(\d+)', date_str)
@@ -71,92 +96,100 @@ class TWSECrawler:
     
     def fetch_index_data(self):
         """
-        爬取證交所加權指數資料 (使用 JSON API)
+        爬取證交所加權指數資料
         
         Returns:
             dict: 包含最新加權指數資料的字典，若失敗則返回None
         """
         try:
-            now = self.get_taiwan_current_time()
-            date_str = now.strftime("%Y%m%d")
-            
-            # 使用 JSON API
-            url = f"{self.base_url}?response=json&date={date_str}"
-            print(f"請求 URL: {url}")
-            
-            # 發送請求
-            print("發送請求到台灣證交所...")
-            response = requests.get(url, headers=self.headers, timeout=30)
-            response.raise_for_status()
-            
-            # 解析 JSON 響應
-            data = response.json()
-            
-            # 輸出響應狀態和部分數據以便調試
-            print(f"響應狀態: {data.get('stat')}")
-            print(f"響應標題: {data.get('title')}")
-            
-            # 檢查響應狀態
-            if data.get('stat') != 'OK':
-                print(f"API 返回錯誤狀態: {data.get('stat')}")
-                print(f"完整響應: {data}")
-                return None
-            
-            # 檢查數據欄位
-            if 'fields' not in data or 'data' not in data or not data['data']:
-                print("API 返回的數據結構不完整或為空")
-                print(f"完整響應: {data}")
-                return None
-            
-            # 獲取欄位名稱和對應的索引
-            fields = data['fields']
-            print(f"數據欄位: {fields}")
-            
-            # 確保有必要的欄位
-            required_fields = ['日期', '成交金額', '成交股數', '成交筆數', '發行量加權股價指數', '漲跌點數']
-            for field in required_fields:
-                if field not in fields:
-                    print(f"缺少必要欄位: {field}")
-                    return None
-            
-            # 獲取各欄位的索引
-            date_index = fields.index('日期')
-            trading_value_index = fields.index('成交金額')
-            trading_volume_index = fields.index('成交股數')
-            transactions_index = fields.index('成交筆數')
-            index_index = fields.index('發行量加權股價指數')
-            change_index = fields.index('漲跌點數')
-            
-            # 獲取最新一筆資料（最後一行）
-            latest_row = data['data'][-1]
-            print(f"最新資料行: {latest_row}")
-            
-            # 轉換日期格式
-            iso_date = self._convert_chinese_date_to_iso(latest_row[date_index])
-            if not iso_date:
-                print(f"無法轉換日期格式: {latest_row[date_index]}")
-                return None
-            
-            # 整理資料結構
-            result = {
-                "date": iso_date,
-                "chinese_date": latest_row[date_index],
-                "trading_value": latest_row[trading_value_index],
-                "trading_volume": latest_row[trading_volume_index],
-                "transactions": latest_row[transactions_index],
-                "index": latest_row[index_index],
-                "change": latest_row[change_index],
-                "fetched_at": self.get_taiwan_current_time().isoformat()
+            # 基本URL和請求頭
+            url = "https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?response=html"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Referer": "https://www.twse.com.tw/",
             }
             
-            print(f"整理後的數據: {result}")
+            print("發送HTTP請求獲取加權指數數據...")
+            response = requests.get(url, headers=headers, timeout=30)
             
-            # 儲存到資料庫
-            if self.collection:
-                success = self._save_to_database(result)
-                print(f"數據保存結果: {'成功' if success else '失敗'}")
+            if response.status_code != 200:
+                print(f"HTTP請求失敗，狀態碼: {response.status_code}")
+                return None
             
-            return result
+            # 解析HTML
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 找到表格
+            table = soup.find('table')
+            if not table:
+                print("找不到表格元素")
+                return None
+            
+            # 解析表格為DataFrame
+            print("解析表格數據...")
+            tables = pd.read_html(str(table))
+            
+            if not tables or len(tables) == 0:
+                print("無法使用pandas解析表格")
+                return None
+                
+            df = tables[0]
+            
+            # 檢查DataFrame是否為空
+            if df.empty:
+                print("解析的表格為空")
+                return None
+            
+            # 輸出DataFrame的列名和前幾行以進行調試
+            print(f"表格列名: {df.columns.tolist()}")
+            print(f"表格前5行: {df.head()}")
+            
+            # 檢查所需列是否存在
+            required_columns = ['日期', '成交金額', '成交股數', '成交筆數', '發行量加權股價指數', '漲跌點數']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                print(f"缺少必要列: {missing_columns}")
+                return None
+            
+            # 獲取最新一筆資料（最後一行）
+            if len(df) > 0:
+                latest_data = df.iloc[-1].to_dict()
+                print(f"最新資料: {latest_data}")
+                
+                # 轉換日期格式
+                iso_date = self._convert_chinese_date_to_iso(latest_data['日期'])
+                if not iso_date:
+                    print(f"無法轉換日期格式: {latest_data['日期']}")
+                    return None
+                
+                # 處理NaN值
+                for key, value in latest_data.items():
+                    if pd.isna(value):
+                        latest_data[key] = "0"
+                
+                # 整理資料結構
+                result = {
+                    "date": iso_date,
+                    "chinese_date": latest_data['日期'],
+                    "trading_value": str(latest_data['成交金額']),
+                    "trading_volume": str(latest_data['成交股數']),
+                    "transactions": str(latest_data['成交筆數']),
+                    "index": str(latest_data['發行量加權股價指數']),
+                    "change": str(latest_data['漲跌點數']),
+                    "fetched_at": self.get_taiwan_current_time().isoformat()
+                }
+                
+                # 儲存到資料庫
+                if self.collection:
+                    success = self._save_to_database(result)
+                    print(f"數據保存{'成功' if success else '失敗'}")
+                
+                return result
+            else:
+                print("表格中沒有數據行")
+                return None
             
         except Exception as e:
             print(f"爬取加權指數資料時發生錯誤: {str(e)}")
@@ -252,9 +285,6 @@ class TWSECrawler:
         Returns:
             dict: 包含最新加權指數資料的字典，若失敗則返回None
         """
-        import time
-        import random
-        
         last_data = None
         
         for attempt in range(max_retries):
@@ -270,8 +300,7 @@ class TWSECrawler:
                     print("忽略時間檢查，直接返回數據")
                     return data
                 
-                # 檢查資料日期是否為最新
-                # 在實際應用中，您可能需要更複雜的邏輯來確定資料是否為最新
+                # 簡單檢查數據是否有效
                 print(f"成功獲取數據，日期為: {data['date']}")
                 return data
             
@@ -284,113 +313,20 @@ class TWSECrawler:
         
         print("已達最大重試次數，返回最後一次爬取的結果")
         return last_data  # 返回最後一次爬取的結果，即使可能不是今天的
-    
-    def get_historical_data(self, year, month):
-        """
-        獲取歷史數據
-        
-        Args:
-            year: 年份（西元年）
-            month: 月份 (1-12)
-            
-        Returns:
-            list: 該月份的加權指數資料列表，若失敗則返回None
-        """
-        try:
-            # 轉換為民國年
-            tw_year = year - 1911
-            
-            # 格式化月份
-            month_str = str(month).zfill(2)
-            date_str = f"{tw_year}{month_str}01"  # 使用每月的第一天
-            
-            # 使用 JSON API
-            url = f"{self.base_url}?response=json&date={year}{month_str}01"
-            print(f"請求歷史數據 URL: {url}")
-            
-            # 發送請求
-            print(f"發送請求獲取 {year}年{month}月 數據...")
-            response = requests.get(url, headers=self.headers, timeout=30)
-            response.raise_for_status()
-            
-            # 解析 JSON 響應
-            data = response.json()
-            
-            # 檢查響應狀態
-            if data.get('stat') != 'OK':
-                print(f"API 返回錯誤狀態: {data.get('stat')}")
-                return None
-            
-            # 檢查數據欄位
-            if 'fields' not in data or 'data' not in data or not data['data']:
-                print("API 返回的數據結構不完整或為空")
-                return None
-            
-            # 獲取欄位名稱和對應的索引
-            fields = data['fields']
-            
-            # 確保有必要的欄位
-            required_fields = ['日期', '成交金額', '成交股數', '成交筆數', '發行量加權股價指數', '漲跌點數']
-            for field in required_fields:
-                if field not in fields:
-                    print(f"缺少必要欄位: {field}")
-                    return None
-            
-            # 獲取各欄位的索引
-            date_index = fields.index('日期')
-            trading_value_index = fields.index('成交金額')
-            trading_volume_index = fields.index('成交股數')
-            transactions_index = fields.index('成交筆數')
-            index_index = fields.index('發行量加權股價指數')
-            change_index = fields.index('漲跌點數')
-            
-            # 處理所有數據行
-            results = []
-            for row in data['data']:
-                # 轉換日期格式
-                iso_date = self._convert_chinese_date_to_iso(row[date_index])
-                if not iso_date:
-                    print(f"無法轉換日期格式: {row[date_index]}")
-                    continue
-                
-                # 整理資料結構
-                result = {
-                    "date": iso_date,
-                    "chinese_date": row[date_index],
-                    "trading_value": row[trading_value_index],
-                    "trading_volume": row[trading_volume_index],
-                    "transactions": row[transactions_index],
-                    "index": row[index_index],
-                    "change": row[change_index],
-                    "fetched_at": self.get_taiwan_current_time().isoformat()
-                }
-                
-                results.append(result)
-                
-                # 儲存到資料庫
-                if self.collection:
-                    self._save_to_database(result)
-            
-            print(f"成功獲取 {year}年{month}月 數據，共 {len(results)} 筆")
-            return results
-            
-        except Exception as e:
-            print(f"獲取歷史數據時發生錯誤: {str(e)}")
-            traceback.print_exc()
-            return None
 
+# 用於直接測試
 def main():
     """主程式"""
     try:
         # 初始化爬蟲
         crawler = TWSECrawler()
         
-        # 爬取最新數據
-        print("開始爬取加權指數最新數據...")
-        data = crawler.fetch_index_data()
+        # 爬取數據
+        print("開始爬取加權指數數據...")
+        data = crawler.check_and_fetch_data()
         
         if data:
-            print("成功爬取到最新數據：")
+            print("成功爬取到數據：")
             print(f"- 日期：{data.get('date', 'N/A')}")
             print(f"- 指數：{data.get('index', 'N/A')}")
             print(f"- 漲跌：{data.get('change', 'N/A')}")
@@ -400,29 +336,7 @@ def main():
             print("格式化輸出：")
             print(output)
         else:
-            print("無法取得最新加權指數資料，嘗試獲取本月歷史數據...")
-            
-            # 如果無法獲取最新數據，嘗試獲取本月的歷史數據
-            now = crawler.get_taiwan_current_time()
-            year = now.year
-            month = now.month
-            
-            historical_data = crawler.get_historical_data(year, month)
-            
-            if historical_data and len(historical_data) > 0:
-                print(f"成功獲取 {year}年{month}月 歷史數據，共 {len(historical_data)} 筆")
-                print("最新一筆歷史數據：")
-                latest = historical_data[-1]
-                print(f"- 日期：{latest.get('date', 'N/A')}")
-                print(f"- 指數：{latest.get('index', 'N/A')}")
-                print(f"- 漲跌：{latest.get('change', 'N/A')}")
-                
-                # 格式化輸出
-                output = crawler.format_output(latest)
-                print("格式化輸出：")
-                print(output)
-            else:
-                print("無法獲取任何加權指數資料")
+            print("無法取得加權指數資料")
             
     except Exception as e:
         print(f"執行主程式時發生錯誤: {str(e)}")
