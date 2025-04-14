@@ -187,7 +187,7 @@ class TWSECrawler:
         
         return formatted_output
     
-    def check_and_fetch_data(self, max_retries=10, retry_interval_min=1, retry_interval_max=3):
+    def check_and_fetch_data(self, max_retries=10, retry_interval_min=1, retry_interval_max=3, ignore_time_check=False):
         """
         檢查並爬取最新數據，如果數據未更新則在指定時間內重試
         
@@ -195,6 +195,7 @@ class TWSECrawler:
             max_retries: 最大重試次數
             retry_interval_min: 最小重試間隔（分鐘）
             retry_interval_max: 最大重試間隔（分鐘）
+            ignore_time_check: 是否忽略時間檢查（用於強制初始化）
             
         Returns:
             dict: 包含最新加權指數資料的字典，若失敗則返回None
@@ -206,6 +207,10 @@ class TWSECrawler:
             # 檢查爬取的資料是否是今天的
             # 注意：假日或是盤後未更新時，最新數據可能不是今天的
             if data:
+                # 如果設置了忽略時間檢查，直接返回數據
+                if ignore_time_check:
+                    return data
+                    
                 taiwan_now = get_taiwan_current_time()
                 today_date = taiwan_now.strftime("%Y-%m-%d")
                 
