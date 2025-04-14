@@ -20,7 +20,7 @@ from crawlers.twse_crawler import TWSECrawler
 # from crawlers.other_crawler import OtherCrawler
 
 # 導入 Line Bot 模組和工具函數
-from line_bot_integration import send_daily_push_notification
+from line_bot_integration import send_daily_push_notification, line_bot_bp
 from utils import (
     get_taiwan_current_time, check_trading_day, update_holiday_database,
     should_crawl_on_startup, check_if_already_crawled_today
@@ -30,6 +30,9 @@ from utils import (
 load_dotenv()
 
 app = Flask(__name__)
+
+# 註冊 Line Bot Blueprint
+app.register_blueprint(line_bot_bp)
 
 # 設置資料庫連接
 mongodb_uri = os.getenv("MONGODB_URI")
@@ -190,6 +193,49 @@ def trigger_update_holidays():
         "status": "success" if success else "error",
         "message": "假日資料已更新" if success else "更新假日資料失敗"
     })
+
+@app.route("/test-db")
+def test_db():
+    """
+    測試資料庫連接的 API 端點
+    """
+    try:
+        if not db_client:
+            return jsonify({"status": "error", "message": "未連接到資料庫"})
+        
+        dbs = db_client.list_database_names()
+        return jsonify({"status": "success", "databases": dbs})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/check-line-bot")
+def check_line_bot():
+    """
+    檢查 Line Bot 設置是否正確
+    """
+    try:
+        token = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
+        secret = os.environ.get('LINE_CHANNEL_SECRET')
+        target = os.environ.get('LINE_PUSH_TARGET')
+        
+        if not token or not secret:
+            return jsonify({
+                "status": "warning", 
+                "message": "Line Bot 認證設置不完整",
+                "token_set": bool(token),
+                "secret_set": bool(secret),
+                "target_set": bool(target)
+            })
+            
+        return jsonify({
+            "status": "success", 
+            "message": "Line Bot 設置正確",
+            "token_set": bool(token),
+            "secret_set": bool(secret),
+            "target_set": bool(target)
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
 
 if __name__ == "__main__":
     # 在啟動時進行系統初始化
