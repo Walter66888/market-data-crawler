@@ -14,13 +14,17 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from flask import Flask, request, jsonify, abort
 
-# 導入爬蟲模組 - 現在從 crawlers 包中導入
+# 導入爬蟲模組 - 從 crawlers 包中導入
 from crawlers.twse_crawler import TWSECrawler
 # 後續可以添加其他爬蟲:
 # from crawlers.other_crawler import OtherCrawler
 
-# 導入 Line Bot 模組
+# 導入 Line Bot 模組和工具函數
 from line_bot_integration import send_daily_push_notification
+from utils import (
+    get_taiwan_current_time, check_trading_day, update_holiday_database,
+    should_crawl_on_startup, check_if_already_crawled_today
+)
 
 # 載入環境變數
 load_dotenv()
@@ -37,32 +41,9 @@ else:
     db_client = None
     db = None
 
-def _get_taiwan_current_time():
-    """取得台灣目前時間"""
-    taiwan_tz = pytz.timezone('Asia/Taipei')
-    return datetime.now(taiwan_tz)
-
-def check_trading_day():
-    """
-    檢查今天是否為交易日（簡化版）
-    
-    Returns:
-        bool: 是否為交易日
-    """
-    now = _get_taiwan_current_time()
-    
-    # 週末不是交易日
-    if now.weekday() >= 5:  # 5是星期六，6是星期日
-        return False
-    
-    # 這裡可以加入更多邏輯來處理特殊假日
-    # 例如：可以維護一個假日列表或查詢外部API
-    
-    return True
-
 def crawl_all_data():
     """爬取所有數據"""
-    print(f"開始爬取所有數據 - {_get_taiwan_current_time().isoformat()}")
+    print(f"開始爬取所有數據 - {get_taiwan_current_time().isoformat()}")
     
     # 檢查是否為交易日
     if not check_trading_day():
@@ -70,7 +51,7 @@ def crawl_all_data():
         return False
     
     # 檢查是否在工作時間內
-    now = _get_taiwan_current_time()
+    now = get_taiwan_current_time()
     if now.hour < 14 or (now.hour == 14 and now.minute < 50):
         print("尚未到達盤後資料時間（14:50後），跳過爬取")
         return False
@@ -124,6 +105,9 @@ def run_scheduler():
     # 這是為了防止排程錯過2:50的執行時間
     schedule.every().hour.do(check_and_crawl_if_needed)
     
+    # 設定每週一更新假日資料庫
+    schedule.every().monday.do(update_holiday_database)
+    
     # 持續運行排程
     while True:
         schedule.run_pending()
@@ -131,7 +115,7 @@ def run_scheduler():
 
 def check_and_crawl_if_needed():
     """檢查是否需要執行爬蟲任務"""
-    now = _get_taiwan_current_time()
+    now = get_taiwan_current_time()
     
     # 如果現在是交易日，且時間在14:50到18:00之間，且今天還沒有成功爬取數據
     if (check_trading_day() and 
@@ -142,25 +126,22 @@ def check_and_crawl_if_needed():
     
     return False
 
-def check_if_already_crawled_today():
-    """
-    檢查今天是否已經成功爬取過數據
+def initialize_system():
+    """系統初始化函數"""
+    print("正在初始化系統...")
     
-    Returns:
-        bool: 是否已經爬取
-    """
-    if not db:
-        return False
+    # 確保市場假日資料已更新
+    try:
+        update_holiday_database()
+    except Exception as e:
+        print(f"更新假日資料時出錯: {str(e)}")
     
-    now = _get_taiwan_current_time()
-    today_start = datetime(now.year, now.month, now.day, tzinfo=now.tzinfo)
+    # 檢查是否需要在啟動時執行爬蟲
+    if should_crawl_on_startup():
+        print("系統重新啟動，檢測到需要執行爬蟲任務...")
+        threading.Thread(target=crawl_all_data).start()
     
-    # 檢查今天是否已經有爬取記錄
-    result = db.twse_index.find_one({
-        "fetched_at": {"$gte": today_start.isoformat()}
-    })
-    
-    return result is not None
+    print("系統初始化完成")
 
 @app.route("/")
 def home():
@@ -170,7 +151,12 @@ def home():
 @app.route("/health")
 def health_check():
     """健康檢查"""
-    return jsonify({"status": "healthy", "time": _get_taiwan_current_time().isoformat()})
+    return jsonify({
+        "status": "healthy", 
+        "time": get_taiwan_current_time().isoformat(),
+        "is_trading_day": check_trading_day(),
+        "already_crawled_today": check_if_already_crawled_today()
+    })
 
 @app.route("/manual-crawl", methods=['POST'])
 def manual_crawl():
@@ -189,7 +175,26 @@ def manual_crawl():
         "message": "爬蟲已執行" + ("且數據已更新" if success else "但無新數據")
     })
 
+@app.route("/update-holidays", methods=['POST'])
+def trigger_update_holidays():
+    """
+    手動觸發更新假日資料的 API 端點
+    """
+    # 簡單的 API 金鑰認證
+    api_key = request.headers.get('X-API-KEY')
+    if api_key != os.environ.get('API_KEY'):
+        abort(403)  # 拒絕未授權的訪問
+    
+    success = update_holiday_database()
+    return jsonify({
+        "status": "success" if success else "error",
+        "message": "假日資料已更新" if success else "更新假日資料失敗"
+    })
+
 if __name__ == "__main__":
+    # 在啟動時進行系統初始化
+    initialize_system()
+    
     # 在背景執行排程任務
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
