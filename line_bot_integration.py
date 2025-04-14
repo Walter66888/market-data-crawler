@@ -224,22 +224,45 @@ def callback_test():
         "line_bot_initialized": bool(line_bot_api and handler)
     })
 
-def handle_message_wrapper(event):
-    """處理用戶訊息的包裝函數，用於捕獲異常"""
-    try:
-        handle_message(event)
-    except Exception as e:
-        print(f"處理訊息時出錯: {str(e)}")
-        traceback.print_exc()
+def handle_message(event):
+    """處理用戶訊息"""
+    text = event.message.text.strip()
+    
+    if text.lower() in ['盤後', '盤後資訊', '盤後籌碼', '今日盤後', '加權指數']:
+        # 提供盤後資訊
+        market_data = get_latest_market_data()
         
-        # 嘗試發送錯誤訊息
-        try:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="處理您的訊息時出現問題，請稍後再試。")
+        if not market_data:
+            # 如果無法獲取市場資料，建議強制初始化爬蟲
+            message = (
+                "目前尚未有盤後資料，請稍後再試。\n"
+                "系統將在每日收盤後自動更新資料。"
             )
-        except Exception as e2:
-            print(f"發送錯誤訊息時出錯: {str(e2)}")
+        else:
+            message = format_market_data_message(market_data)
+        
+        # 添加快速回覆按鈕
+        quick_reply = QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="加權指數", text="加權指數")),
+            # 可以添加其他快速回覆按鈕
+        ])
+        
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=message, quick_reply=quick_reply)
+        )
+    else:
+        # 處理其他類型的消息
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=(
+                "您好！我是盤後籌碼小幫手。\n"
+                "您可以輸入以下關鍵字查詢資訊：\n"
+                "- 盤後\n"
+                "- 加權指數\n"
+                # 可以添加其他命令
+            ))
+        )
 
 # 使用包裝函數註冊處理器
 if handler:
