@@ -53,7 +53,7 @@ def crawl_all_data():
         print("今天不是交易日，跳過爬取")
         return False
     
-    # 檢查是否在工作時間內
+    # 檢查是否在工作時間內 (在強制初始化時跳過此檢查)
     now = get_taiwan_current_time()
     if now.hour < 14 or (now.hour == 14 and now.minute < 50):
         print("尚未到達盤後資料時間（14:50後），跳過爬取")
@@ -99,6 +99,28 @@ def crawl_all_data():
     
     return data_updated
 
+# 添加一個無視時間檢查的強制爬蟲函數，用於初始化
+def force_crawl_data():
+    """強制爬取資料，用於初始化"""
+    print(f"強制爬取初始數據 - {get_taiwan_current_time().isoformat()}")
+    
+    data_updated = False
+    all_data = {}
+    
+    # 爬取加權指數資料
+    try:
+        twse_crawler = TWSECrawler(db_client)
+        index_data = twse_crawler.check_and_fetch_data(ignore_time_check=True)
+        if index_data:
+            all_data["index_data"] = index_data
+            data_updated = True
+    except Exception as e:
+        print(f"強制爬取加權指數資料時出錯: {str(e)}")
+    
+    # 這裡可以加入其他爬蟲模組的強制爬取
+    
+    return data_updated
+
 def run_scheduler():
     """執行排程任務"""
     # 設定每日下午2:50執行爬蟲任務
@@ -129,22 +151,54 @@ def check_and_crawl_if_needed():
     
     return False
 
+def check_database_initialized():
+    """檢查資料庫是否已初始化"""
+    if not db_client:
+        return False
+    
+    try:
+        # 檢查是否存在 market_data 資料庫
+        databases = db_client.list_database_names()
+        if "market_data" not in databases:
+            return False
+        
+        # 檢查重要集合是否存在且有數據
+        has_holidays = db.market_holidays.count_documents({}) > 0
+        has_index_data = db.twse_index.count_documents({}) > 0
+        
+        return has_holidays and has_index_data
+    except Exception as e:
+        print(f"檢查資料庫初始化狀態時出錯: {str(e)}")
+        return False
+
 def initialize_system():
     """系統初始化函數"""
     print("正在初始化系統...")
     
-    # 確保市場假日資料已更新
-    try:
-        update_holiday_database()
-    except Exception as e:
-        print(f"更新假日資料時出錯: {str(e)}")
+    # 檢查資料庫是否已初始化
+    is_initialized = check_database_initialized()
     
-    # 檢查是否需要在啟動時執行爬蟲
-    if should_crawl_on_startup():
-        print("系統重新啟動，檢測到需要執行爬蟲任務...")
-        threading.Thread(target=crawl_all_data).start()
-    
-    print("系統初始化完成")
+    if not is_initialized:
+        print("系統尚未初始化，開始執行自動初始化...")
+        try:
+            # 初始化假日資料庫
+            print("正在初始化假日資料...")
+            update_holiday_database()
+            
+            # 強制爬取初始數據
+            print("正在爬取初始數據...")
+            force_crawl_data()
+            
+            print("系統初始化完成")
+        except Exception as e:
+            print(f"系統初始化過程中出錯: {str(e)}")
+    else:
+        print("系統已初始化，檢查是否需要更新...")
+        
+        # 檢查是否需要在啟動時執行爬蟲
+        if should_crawl_on_startup():
+            print("系統重新啟動，檢測到需要執行爬蟲任務...")
+            threading.Thread(target=crawl_all_data).start()
 
 @app.route("/")
 def home():
@@ -154,11 +208,15 @@ def home():
 @app.route("/health")
 def health_check():
     """健康檢查"""
+    # 檢查資料庫初始化狀態
+    db_initialized = check_database_initialized()
+    
     return jsonify({
         "status": "healthy", 
         "time": get_taiwan_current_time().isoformat(),
         "is_trading_day": check_trading_day(),
-        "already_crawled_today": check_if_already_crawled_today()
+        "already_crawled_today": check_if_already_crawled_today(),
+        "database_initialized": db_initialized
     })
 
 @app.route("/manual-crawl", methods=['POST'])
@@ -177,6 +235,35 @@ def manual_crawl():
         "status": "success" if success else "no_update",
         "message": "爬蟲已執行" + ("且數據已更新" if success else "但無新數據")
     })
+
+@app.route("/force-initialize", methods=['POST'])
+def force_initialize():
+    """
+    強制初始化系統的 API 端點
+    """
+    # 簡單的 API 金鑰認證
+    api_key = request.headers.get('X-API-KEY')
+    if api_key != os.environ.get('API_KEY'):
+        abort(403)  # 拒絕未授權的訪問
+    
+    try:
+        # 更新假日資料
+        update_success = update_holiday_database()
+        
+        # 強制爬取數據
+        crawl_success = force_crawl_data()
+        
+        return jsonify({
+            "status": "success",
+            "update_holidays": update_success,
+            "crawl_data": crawl_success,
+            "message": "系統已強制初始化"
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"初始化過程中出錯: {str(e)}"
+        })
 
 @app.route("/update-holidays", methods=['POST'])
 def trigger_update_holidays():
@@ -204,7 +291,20 @@ def test_db():
             return jsonify({"status": "error", "message": "未連接到資料庫"})
         
         dbs = db_client.list_database_names()
-        return jsonify({"status": "success", "databases": dbs})
+        
+        # 檢查初始化狀態
+        is_initialized = check_database_initialized()
+        collections = []
+        
+        if "market_data" in dbs:
+            collections = db.list_collection_names()
+        
+        return jsonify({
+            "status": "success", 
+            "databases": dbs,
+            "initialized": is_initialized,
+            "collections": collections
+        })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
