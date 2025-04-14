@@ -14,9 +14,10 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from flask import Flask, request, jsonify, abort
 
-# 導入各爬蟲模組
-from twse_crawler import TWSECrawler
-# 後續會導入其他爬蟲模組
+# 導入爬蟲模組 - 現在從 crawlers 包中導入
+from crawlers.twse_crawler import TWSECrawler
+# 後續可以添加其他爬蟲:
+# from crawlers.other_crawler import OtherCrawler
 
 # 導入 Line Bot 模組
 from line_bot_integration import send_daily_push_notification
@@ -94,6 +95,15 @@ def crawl_all_data():
         print(f"爬取加權指數資料時出錯: {str(e)}")
     
     # 這裡可以加入其他爬蟲模組的調用
+    # 例如：
+    # try:
+    #     other_crawler = OtherCrawler(db_client)
+    #     other_data = other_crawler.check_and_fetch_data()
+    #     if other_data:
+    #         all_data["other_data"] = other_data
+    #         data_updated = True
+    # except Exception as e:
+    #     print(f"爬取其他資料時出錯: {str(e)}")
     
     # 如果有數據更新，則發送 Line 通知
     if data_updated:
