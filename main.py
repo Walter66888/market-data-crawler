@@ -483,3 +483,46 @@ if __name__ == "__main__":
     # 啟動 Flask 應用
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
+@app.route("/test-twse-api")
+def test_twse_api():
+    """測試台灣證交所 API"""
+    try:
+        # 使用 JSON API
+        url = "https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?response=json"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.twse.com.tw/",
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        result = {
+            "status_code": response.status_code,
+        }
+        
+        if response.status_code == 200:
+            data = response.json()
+            result["api_status"] = data.get("stat")
+            result["api_title"] = data.get("title")
+            
+            if "fields" in data and "data" in data:
+                result["fields"] = data["fields"]
+                result["data_count"] = len(data["data"])
+                if data["data"]:
+                    result["latest_row"] = data["data"][-1]
+            else:
+                result["error"] = "無法找到有效數據欄位"
+                result["full_response"] = data
+        else:
+            result["error"] = f"API 請求失敗: {response.text[:500]}"
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        })
